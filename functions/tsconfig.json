@@ -4,7 +4,8 @@
     "outDir": "lib",
     "experimentalDecorators": true,
     "noEmit": true,
-    "noImplicitAny": true
+    "noImplicitAny": true,
+    "lib": ["ESNext"]
   },
   "exclude": ["test"],
   "include": ["src/**/*.ts"]
