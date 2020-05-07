@@ -37,6 +37,11 @@ const (
 	argonThreads = 1    // Use one thread
 )
 
+var (
+	challengeExpiredError = util.NewBadRequestError(errors.New("challenge expired"))
+	invalidSolutionError  = util.NewBadRequestError(errors.New("invalid solution to proof of work challenge"))
+)
+
 type nonce [nonceLen]byte
 
 func (n nonce) MarshalJSON() ([]byte, error) {
@@ -117,20 +122,6 @@ type ChallengeSolution struct {
 	Solution  Solution  `json:"solution"`
 }
 
-// InvalidSolutionError is returned when a challenge solution is invalid.
-type InvalidSolutionError struct{}
-
-func (e InvalidSolutionError) Error() string {
-	return "invalid solution to proof of work challenge"
-}
-
-// ChallengeExpiredError is returned when a challenge has expired.
-type ChallengeExpiredError struct{}
-
-func (e ChallengeExpiredError) Error() string {
-	return "challenge expired"
-}
-
 func generateChallenge(workFactor uint64) Challenge {
 	var nonce nonce
 	if _, err := rand.Read(nonce[:]); err != nil {
@@ -140,7 +131,7 @@ func generateChallenge(workFactor uint64) Challenge {
 	return Challenge{challenge{nonce, workFactor}}
 }
 
-func validateSolutionInner(c Challenge, s Solution) error {
+func validateSolutionInner(c Challenge, s Solution) util.StatusError {
 	// Unfortunately, Argon2d is not exposed, and probably never will be. [1] We
 	// want the GPU-resistance properties of Argon2d, so it's best to settle for
 	// Argon2id, which is as safe as Argon2d, but slower.
@@ -148,7 +139,7 @@ func validateSolutionInner(c Challenge, s Solution) error {
 	// [1] https://github.com/golang/go/issues/23602
 	res := binary.BigEndian.Uint64(argon2.IDKey(s.inner.Nonce[:], c.inner.Nonce[:], argonTime, argonMemory, argonThreads, keyLen))
 	if res%c.inner.WorkFactor != 0 {
-		return InvalidSolutionError{}
+		return invalidSolutionError
 	}
 	return nil
 }
@@ -164,7 +155,6 @@ func GenerateChallenge(ctx util.Context) (*Challenge, error) {
 	c := generateChallenge(defaultWorkFactor)
 
 	doc := challengeDoc{Expiration: time.Now().Add(expirationPeriod)}
-	fmt.Println(doc.Expiration)
 	_, err := ctx.FirestoreClient().Collection(challengeCollection).Doc(c.docID()).Create(ctx, doc)
 	if err != nil {
 		return nil, err
@@ -173,16 +163,16 @@ func GenerateChallenge(ctx util.Context) (*Challenge, error) {
 	return &c, nil
 }
 
-func validateSolution(ctx *util.Context, cs ChallengeSolution) error {
+func validateSolution(ctx *util.Context, cs ChallengeSolution) util.StatusError {
 	doc := ctx.FirestoreClient().Collection(challengeCollection).Doc(cs.Challenge.docID())
 	snapshot, err := doc.Get(ctx)
 	if err != nil {
-		return err
+		return util.FirestoreToStatusError(err)
 	}
 
 	var challengeDoc challengeDoc
 	if err = snapshot.DataTo(&challengeDoc); err != nil {
-		return err
+		return util.FirestoreToStatusError(err)
 	}
 
 	// Delete the document before we validate. It's important that
@@ -195,13 +185,12 @@ func validateSolution(ctx *util.Context, cs ChallengeSolution) error {
 	//   client is buggy) or an expired challenge (in which case the challenge
 	//   should be deleted from the database anyway)
 	if _, err = doc.Delete(ctx); err != nil {
-		return err
+		return util.FirestoreToStatusError(err)
 	}
 
 	now := time.Now()
-	fmt.Printf("now:%v,exp:%v\n", now, challengeDoc.Expiration)
 	if challengeDoc.Expiration.Before(now) {
-		return ChallengeExpiredError{}
+		return challengeExpiredError
 	}
 
 	return validateSolutionInner(cs.Challenge, cs.Solution)
@@ -223,9 +212,9 @@ type Guarded interface {
 //
 // If the challenge is found in the database, it is deleted so that it cannot be
 // reused.
-func UnmarshalAndValidateSolution(ctx *util.Context, req Guarded) error {
+func UnmarshalAndValidateSolution(ctx *util.Context, req Guarded) util.StatusError {
 	if err := json.NewDecoder(ctx.HTTPRequest().Body).Decode(req); err != nil {
-		return err
+		return util.JSONToStatusError(err)
 	}
 
 	return validateSolution(ctx, req.ChallengeSolution())
